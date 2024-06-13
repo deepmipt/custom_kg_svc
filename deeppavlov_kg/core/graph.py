@@ -8,7 +8,7 @@ from neo4j import graph as neo4j_graph
 from neo4j.exceptions import ClientError
 from deeppavlov_kg.core.ontology import Neo4jOntologyConfig, TerminusdbOntologyConfig
 from deeppavlov_kg.core import querymaker
-
+from deeppavlov_kg.core.index import Index
 from terminusdb_client import WOQLClient, WOQLQuery as WOQL
 from terminusdb_client.errors import InterfaceError, DatabaseError
 
@@ -880,12 +880,13 @@ class Neo4jKnowledgeGraph(KnowledgeGraph):
 class TerminusdbKnowledgeGraph(KnowledgeGraph):
     def __init__(
         self,
-        team: str,
         db_name: str,
+        team: str = "",
         server: Optional[str] = None,
         local: bool = False,
         username: str = "admin",
         password: str = "root",
+        index_load_path: Optional[Path] = None,
     ):
         """
             Connecting to cloud doesn't need a password, just make sure you export your token or add it to '.env' file
@@ -902,6 +903,8 @@ class TerminusdbKnowledgeGraph(KnowledgeGraph):
                 self._client.connect(key=password)
                 self._client.create_database(self._db)
         else:
+            if not self._team:
+                raise ValueError("team argument should be passed when you're connecting to local or cloud")
             if local:
                 self._client = WOQLClient("http://localhost:6363", account=username, team=self._team, key=password)
                 try:
@@ -917,21 +920,44 @@ class TerminusdbKnowledgeGraph(KnowledgeGraph):
                 except InterfaceError:
                     self._client.connect(team=self._team, use_token=True)
                     self._client.create_database(db_name)
+        logger.info("Connected to the database")
         self.ontology = TerminusdbOntologyConfig(self._client, self)
+        if index_load_path is not None:
+            self.set_index(index_load_path)
+        else:
+            self.index = None
 
-    def drop_database(self):
-        """Clears the database from ontology and knowledge graphs."""
-        DB = self._client.db
-        TEAM = self._client.team
-        self._client.delete_database(DB, team=TEAM)
-        self._client.create_database(DB, team=TEAM)
-        logger.info("Database was recreated successfully")
-        self.ontology.init_abstract_kind()
-        logger.info("Abstract kind has been initialized")
+    def set_index(self, index_load_path):
+        self.index = Index(index_load_path)
 
+    def drop_database(self, drop_index=False):
+        if drop_index:
+            try:
+                self.index.drop_index()
+            except AttributeError:
+                raise ValueError("Index isn't loaded. Use set_index method")
+        """Clears only the knowledge graph database keeping the ontology withou change."""
+        query = WOQL().quad(
+            "v:a", "v:r", "v:b", "instance"
+        ).woql_not(
+            WOQL().quad("v:a", "rdf:type", "@schema:Abstract", "instance")
+        ).delete_quad(
+            "v:a", "v:r", "v:b", "instance"
+        )
+        results = query.execute(self._client)
+        if results == "Commit successfully made.":
+            logger.info("Graph database was cleared successfully")
+        return results
 
-    def create_entities(self, entity_kinds: List[str], entity_ids: List[str], property_kinds: Optional[List[List[str]]] = None, property_values: Optional[List[List[Any]]] = None):
+    def create_entities(self, entity_kinds: List[str], entity_ids: List[str], property_kinds: Optional[List[List[str]]] = None, property_values: Optional[List[List[Any]]] = None, add_to_index: bool = False):
         """create an entity, or rewrite above it if it exists"""
+        if add_to_index:
+            if self.index is None:
+                raise ValueError("Index isn't loaded. Use set_index method")
+            entity_substr_list = [id.split("/")[-1] for id in entity_ids]
+            logger.debug(f"Adding entities to index: entity_substr_list -- {entity_substr_list}")
+            self.index.add_entities(entity_substr_list, entity_ids, entity_kinds)
+
         assert len(entity_kinds) == len(entity_ids), (
             f"Number of entity kinds should equal number of entity ids. Got: {len(entity_kinds)} kinds and {len(entity_ids)} ids"
         )
@@ -945,21 +971,31 @@ class TerminusdbKnowledgeGraph(KnowledgeGraph):
             )
             for entity, property_kinds_of_this_entity, property_values_of_this_entity in zip(entities, property_kinds, property_values):
                 entity.update(dict(zip(property_kinds_of_this_entity, property_values_of_this_entity)))
-        return self._client.insert_document(entities)
+        result = self._client.insert_document(entities)
+        for entity_id in entity_ids:
+            logger.info(f"Created entity '{entity_id}' successfully")
+        return result
 
 
-    def create_entity(self, kind: str, entity_id: str, property_kinds: Optional[List[str]] = None, property_values: Optional[List[Any]] = None):
+    def create_entity(
+        self,
+        kind: str,
+        entity_id: str,
+        property_kinds: Optional[List[str]] = None,
+        property_values: Optional[List[Any]] = None
+    ):
         """create an entity, or rewrite above it if it exists"""
-        updated_properties = {
-            "@type": kind,
-            "@id": entity_id,
-        }
-        if property_kinds is not None and property_values is not None:
-            assert len(property_kinds) == len(property_values), (
-                "Number of property values should equal number of property kinds"
-            )
-            updated_properties.update(dict(zip(property_kinds, property_values)))
-        return self._client.insert_document(updated_properties)
+        if property_kinds is not None:
+            property_kinds = [property_kinds] #type: ignore
+        if property_values is not None:
+            property_values = [property_values]
+        return self.create_entities(
+            [kind],
+            [entity_id],
+            property_kinds, #type: ignore
+            property_values,
+        )
+
 
     def search_for_entities_by_kinds(self, entity_kinds: List[str]):
         query = WOQL().woql_or(*[
@@ -994,15 +1030,16 @@ class TerminusdbKnowledgeGraph(KnowledgeGraph):
         for k, entity in entities_dict.items():
             entity.update({"@id":k})
         entities = list(entities_dict.values())
-        # try:
-        return self._client.update_document(entities)
-        # except DatabaseError as e:
-        #     raise DatabaseError(
-        #         f"""You must supply the required properties of this document at first. You can fill them with empty values suin.
-        #         Error: {e.error_obj["api:error"]["api:witnesses"][0]["@type"]}
-        #         Field: {e.error_obj["api:error"]["api:witnesses"][0]["field"]}
-        #         """
-        #     )
+
+        result = self._client.update_document(entities)
+        for entity_id, prop_kinds, prop_values in zip(
+            entity_ids, property_kinds, new_property_values
+        ):
+            logger.info(
+                f"Created or updated properties: '{entity_id}--{prop_kinds}->{prop_values}' successfully"
+            )
+        return result
+
     
     def create_or_update_properties_of_entity(self, entity_id: str, property_kinds: List[str], new_property_values: List[Any]):
         return self.create_or_update_properties_of_entities([entity_id], [property_kinds], [new_property_values])
