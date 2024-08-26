@@ -12,8 +12,6 @@ authors = [
 install_requires = [
     "neomodel>=4.0.8",
     "pydantic[dotenv]==1.9.0",
-    "fabulist==1.2.0",
-    "mimesis==5.3.0",
     "pylint==2.13.8",
     "treelib==1.6.1",
     "terminusdb_client @ git+https://github.com/deeppavlov/terminusdb-client-python.git#egg=terminusdb_client",
