@@ -10,7 +10,7 @@ authors = [
 #     install_requires = [line.strip() for line in req_f if line.strip()]
 
 install_requires = [
-    "neomodel==4.0.8",
+    "neomodel>=4.0.8",
     "pydantic[dotenv]==1.9.0",
     "fabulist==1.2.0",
     "mimesis==5.3.0",
